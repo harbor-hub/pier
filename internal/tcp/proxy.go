@@ -15,11 +15,12 @@ import (
 // Proxy runs one listener per mapping; the mappings are independent.
 type Proxy struct {
 	Mappings    []Mapping
-	Resolver    *net.Resolver // nil: system resolver
+	Resolver    string // DNS server for target names, "host[:port]"; empty: system resolver
 	DialTimeout time.Duration
 	Verbose     bool
 	Logf        func(format string, args ...any) // nil: log.Printf
 
+	resolver  *net.Resolver
 	listeners []net.Listener
 	wg        sync.WaitGroup
 
@@ -42,6 +43,7 @@ func (p *Proxy) Start() error {
 		seen[m.Listen] = true
 	}
 
+	p.resolver = newResolver(p.Resolver)
 	p.conns = map[net.Conn]struct{}{}
 
 	for _, m := range p.Mappings {
@@ -118,10 +120,10 @@ func (p *Proxy) forward(client net.Conn, m Mapping) {
 	defer p.track(client, false)
 	defer client.Close()
 
-	dialer := net.Dialer{Timeout: p.DialTimeout, Resolver: p.Resolver}
+	dialer := net.Dialer{Timeout: p.DialTimeout, Resolver: p.resolver}
 	backend, err := dialer.Dial("tcp", m.Target)
 	if err != nil {
-		p.logf("[TCP] %s: %v", m, err)
+		p.logf("[TCP] %s: %v", m, p.dialError(err))
 		return
 	}
 	p.track(backend, true)
@@ -137,6 +139,16 @@ func (p *Proxy) forward(client net.Conn, m Mapping) {
 	go func() { defer wg.Done(); io.Copy(backend, client); closeWrite(backend) }()
 	go func() { defer wg.Done(); io.Copy(client, backend); closeWrite(client) }()
 	wg.Wait()
+}
+
+// dialError names the configured resolver in lookup errors: Go reports the
+// server from /etc/resolv.conf even when the query went to Resolver.
+func (p *Proxy) dialError(err error) error {
+	var dnsErr *net.DNSError
+	if p.Resolver != "" && errors.As(err, &dnsErr) {
+		dnsErr.Server = resolverAddr(p.Resolver)
+	}
+	return err
 }
 
 func (p *Proxy) track(c net.Conn, add bool) {

@@ -51,7 +51,7 @@ func NewTCPCmd(version string) *cobra.Command {
 
 			proxy := &tcp.Proxy{
 				Mappings:    mappings,
-				Resolver:    tcp.NewResolver(resolver),
+				Resolver:    resolver,
 				DialTimeout: dialTimeout,
 				Verbose:     verbose,
 			}

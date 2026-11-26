@@ -2,7 +2,7 @@
 // for backends the client cannot reach directly (e.g. container IPs on Docker
 // Desktop or in WSL2 seen from Windows).
 //
-//	client -> my-app.<domain> -> --dns-stub IP (DNS stub)
+//	client -> my-app.<domain> -> stub IP (DNS stub, --dns-listen)
 //	       -> pier (--http-listen / --https-listen)
 //	       -> backend target looked up by hostname in the records
 //
@@ -20,13 +20,30 @@ import (
 	"time"
 )
 
-const minSourceRefresh = 500 * time.Millisecond
+const (
+	defaultDNSStub   = "127.0.0.1"
+	minSourceRefresh = 500 * time.Millisecond
+)
+
+// DNSListener is one DNS stub listener.
+type DNSListener struct {
+	Addr     string
+	Stub     string   // IP to answer with, or selfStub
+	Upstream []string // where other names go: autoUpstream or IP[:port]; empty: nowhere
+}
+
+func (l DNSListener) String() string {
+	s := l.Addr + "?stub=" + l.Stub
+	for _, u := range l.Upstream {
+		s += "&upstream=" + u
+	}
+	return s
+}
 
 type Pier struct {
 	Version       string
-	DNSAddr       string
+	DNSListeners  []DNSListener
 	DNSDomains    []string
-	DNSStub       string
 	HTTPAddr      string
 	HTTPSAddr     string
 	HTTPSCert     string
@@ -46,11 +63,15 @@ func (p *Pier) Run() error {
 		return err
 	}
 
-	fmt.Printf("\nPier %s\n\n  dns-listen:     %s\n  dns-domain:     %s\n  dns-stub:       %s\n  http-listen:    %s\n  https-listen:   %s\n  https-cert:     %s\n  source:         %s\n  source-refresh: %s\n\n",
+	dnsListen := make([]string, len(p.DNSListeners))
+	for i, l := range p.DNSListeners {
+		dnsListen[i] = l.String()
+	}
+
+	fmt.Printf("\nPier %s\n\n  dns-listen:     %s\n  dns-domain:     %s\n  http-listen:    %s\n  https-listen:   %s\n  https-cert:     %s\n  source:         %s\n  source-refresh: %s\n\n",
 		p.Version,
-		orDisabled(p.DNSAddr),
+		orDisabled(strings.Join(dnsListen, ", ")),
 		strings.Join(p.DNSDomains, ", "),
-		p.DNSStub,
 		orDisabled(p.HTTPAddr),
 		orDisabled(p.HTTPSAddr),
 		orDash(p.HTTPSCert),
@@ -72,11 +93,11 @@ func (p *Pier) Run() error {
 	}
 	handler := newProxyHandler(store, httpsPort, p.Verbose)
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 2+len(p.DNSListeners))
 
-	if p.DNSAddr != "" {
+	for _, l := range p.DNSListeners {
 		go func() {
-			errCh <- serveDNS(p.DNSAddr, p.DNSDomains, net.ParseIP(p.DNSStub), p.Verbose)
+			errCh <- serveDNS(l, p.DNSDomains, p.Verbose)
 		}()
 	}
 
@@ -124,15 +145,23 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 }
 
 func (p *Pier) validate() error {
-	if p.DNSAddr == "" && p.HTTPAddr == "" && p.HTTPSAddr == "" {
+	if len(p.DNSListeners) == 0 && p.HTTPAddr == "" && p.HTTPSAddr == "" {
 		return errors.New("nothing to do: set --dns-listen, --http-listen and/or --https-listen")
 	}
-	if p.DNSAddr != "" {
-		if len(p.DNSDomains) == 0 {
-			return errors.New("--dns-listen needs --dns-domain")
+	if len(p.DNSListeners) > 0 && len(p.DNSDomains) == 0 {
+		return errors.New("--dns-listen needs --dns-domain")
+	}
+	seen := map[string]bool{}
+	for _, l := range p.DNSListeners {
+		if seen[l.Addr] {
+			return fmt.Errorf("duplicate --dns-listen address %s", l.Addr)
 		}
-		if net.ParseIP(p.DNSStub) == nil {
-			return fmt.Errorf("invalid --dns-stub %q: must be an IP address", p.DNSStub)
+		seen[l.Addr] = true
+		if l.Stub != selfStub && net.ParseIP(l.Stub) == nil {
+			return fmt.Errorf("invalid --dns-listen stub %q: must be an IP address or %q", l.Stub, selfStub)
+		}
+		if err := validateUpstream(l.Upstream); err != nil {
+			return err
 		}
 	}
 	if (p.HTTPSCert == "") != (p.HTTPSKey == "") {

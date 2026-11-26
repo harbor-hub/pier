@@ -2,6 +2,7 @@ package tcp
 
 import (
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -9,7 +10,8 @@ import (
 	"github.com/miekg/dns"
 )
 
-// dnsServer answers A queries for any name with the IP set on it.
+// dnsServer answers A queries for any name with the IP set on it, or NXDOMAIN
+// when none is set.
 type dnsServer struct {
 	mu sync.Mutex
 	ip net.IP
@@ -35,8 +37,11 @@ func (s *dnsServer) start(t *testing.T) string {
 		s.mu.Lock()
 		ip := s.ip
 		s.mu.Unlock()
+		if ip == nil {
+			m.Rcode = dns.RcodeNameError
+		}
 		for _, q := range r.Question {
-			if q.Qtype == dns.TypeA {
+			if q.Qtype == dns.TypeA && ip != nil {
 				m.Answer = append(m.Answer, &dns.A{
 					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0},
 					A:   ip,
@@ -54,7 +59,7 @@ func (s *dnsServer) start(t *testing.T) string {
 func TestNewResolver_SystemWhenEmpty(t *testing.T) {
 	t.Parallel()
 
-	if NewResolver("") != nil {
+	if newResolver("") != nil {
 		t.Error("empty address should mean the system resolver (nil)")
 	}
 }
@@ -76,7 +81,7 @@ func TestProxy_ResolvesOnEveryConnection(t *testing.T) {
 
 	p := &Proxy{
 		Mappings:    []Mapping{{Listen: "127.0.0.1:0", Target: net.JoinHostPort("db.test", port)}},
-		Resolver:    NewResolver(dnsAddr),
+		Resolver:    dnsAddr,
 		DialTimeout: 2 * time.Second,
 	}
 	startProxy(t, p)
@@ -96,7 +101,7 @@ func TestNewResolver_DefaultPort53(t *testing.T) {
 	t.Parallel()
 
 	// No server on port 53 here: only check that the port is added and used.
-	r := NewResolver("127.0.0.1")
+	r := newResolver("127.0.0.1")
 	conn, err := r.Dial(t.Context(), "udp", "ignored")
 	if err != nil {
 		t.Fatal(err)
@@ -104,5 +109,29 @@ func TestNewResolver_DefaultPort53(t *testing.T) {
 	defer conn.Close()
 	if got := conn.RemoteAddr().String(); got != "127.0.0.1:53" {
 		t.Errorf("dials %s, want 127.0.0.1:53", got)
+	}
+}
+
+// Go names the server from /etc/resolv.conf in lookup errors; the log must
+// name the configured resolver, where the query actually went.
+func TestProxy_LookupErrorNamesResolver(t *testing.T) {
+	t.Parallel()
+
+	dnsAddr := (&dnsServer{}).start(t) // no IP: every name is NXDOMAIN
+
+	l := &logs{}
+	p := &Proxy{
+		Mappings:    []Mapping{{Listen: "127.0.0.1:0", Target: "unknown.test:3306"}},
+		Resolver:    dnsAddr,
+		DialTimeout: 2 * time.Second,
+		Logf:        l.logf,
+	}
+	startProxy(t, p)
+
+	if reply, _ := roundTrip(t, p.Addrs()[0].String(), "x"); reply != "" {
+		t.Errorf("got %q, want the connection closed", reply)
+	}
+	if want := "lookup unknown.test on " + dnsAddr + ": no such host"; !strings.Contains(l.String(), want) {
+		t.Errorf("log = %q, want it to contain %q", l, want)
 	}
 }

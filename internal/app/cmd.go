@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -13,9 +14,8 @@ func NewCmd(name, version string) *cobra.Command {
 	pier := New()
 
 	rootCmd := NewRootCmd(name, version, func(c *cobra.Command, args []string) error {
-		dnsAddr, _ := c.Flags().GetString("dns-listen")
+		dnsListen, _ := c.Flags().GetStringArray("dns-listen")
 		dnsDomains, _ := c.Flags().GetString("dns-domain")
-		dnsStub, _ := c.Flags().GetString("dns-stub")
 		httpAddr, _ := c.Flags().GetString("http-listen")
 		httpsAddr, _ := c.Flags().GetString("https-listen")
 		httpsCert, _ := c.Flags().GetString("https-cert")
@@ -26,15 +26,19 @@ func NewCmd(name, version string) *cobra.Command {
 		sourceRefresh, _ := c.Flags().GetDuration("source-refresh")
 		verbose, _ := c.Flags().GetBool("verbose")
 
+		dnsListeners, err := parseDNSListeners(dnsListen)
+		if err != nil {
+			return err
+		}
+
 		token, err := readToken(sourceToken, sourceTokenFile)
 		if err != nil {
 			return err
 		}
 
 		pier.Version = version
-		pier.DNSAddr = dnsAddr
+		pier.DNSListeners = dnsListeners
 		pier.DNSDomains = splitDomains(dnsDomains)
-		pier.DNSStub = dnsStub
 		pier.HTTPAddr = httpAddr
 		pier.HTTPSAddr = httpsAddr
 		pier.HTTPSCert = httpsCert
@@ -48,9 +52,8 @@ func NewCmd(name, version string) *cobra.Command {
 	})
 
 	rootCmd.Flags().SortFlags = false
-	rootCmd.Flags().String("dns-listen", LookupEnv("PIER_DNS_LISTEN", "").GetString(), "DNS stub listen address, e.g. :53 (empty = disabled)")
+	rootCmd.Flags().StringArray("dns-listen", envList("PIER_DNS_LISTEN"), "DNS stub listen address, addr[?stub=IP|self][&upstream=auto|IP[:port]], e.g. :53 (stub default "+defaultDNSStub+", no upstream; repeatable or comma-separated; empty = disabled)")
 	rootCmd.Flags().String("dns-domain", LookupEnv("PIER_DNS_DOMAIN", "pier").GetString(), "Comma-separated domains the DNS stub answers for")
-	rootCmd.Flags().String("dns-stub", LookupEnv("PIER_DNS_STUB", "127.0.0.1").GetString(), "IP address the DNS stub answers with")
 	rootCmd.Flags().String("http-listen", LookupEnv("PIER_HTTP_LISTEN", "").GetString(), "HTTP listen address, e.g. :80 (empty = disabled)")
 	rootCmd.Flags().String("https-listen", LookupEnv("PIER_HTTPS_LISTEN", "").GetString(), "HTTPS listen address, e.g. :443 (empty = disabled)")
 	rootCmd.Flags().String("https-cert", LookupEnv("PIER_HTTPS_CERT", "").GetString(), "TLS certificate file")
@@ -89,6 +92,70 @@ func readToken(token, file string) (string, error) {
 	}
 
 	return strings.TrimSpace(string(data)), nil
+}
+
+// envList returns the env var as a one-element default for a list flag, or
+// nil when it is empty; the flag values are split on commas later.
+func envList(key string) []string {
+	if v := LookupEnv(key, "").GetString(); v != "" {
+		return []string{v}
+	}
+	return nil
+}
+
+// parseDNSListeners parses every --dns-listen value; each may hold several
+// comma-separated listeners.
+func parseDNSListeners(values []string) ([]DNSListener, error) {
+	var listeners []DNSListener
+
+	for _, v := range values {
+		for _, s := range strings.Split(v, ",") {
+			if s = strings.TrimSpace(s); s == "" {
+				continue
+			}
+			l, err := parseDNSListen(s)
+			if err != nil {
+				return nil, err
+			}
+			listeners = append(listeners, l)
+		}
+	}
+
+	return listeners, nil
+}
+
+// parseDNSListen parses "addr[?stub=IP|self][&upstream=auto|IP[:port]...]":
+// the listen address, what the stub answers with (defaultDNSStub when not
+// given) and where other names are forwarded (none when not given).
+func parseDNSListen(s string) (DNSListener, error) {
+	addr, query, _ := strings.Cut(s, "?")
+	l := DNSListener{Addr: addr, Stub: defaultDNSStub}
+	if query == "" {
+		return l, nil
+	}
+	if addr == "" {
+		return DNSListener{}, fmt.Errorf("invalid --dns-listen %q: missing address", s)
+	}
+
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		return DNSListener{}, fmt.Errorf("invalid --dns-listen %q: %w", s, err)
+	}
+	for key, v := range values {
+		switch key {
+		case "stub":
+			if len(v) > 1 {
+				return DNSListener{}, fmt.Errorf("invalid --dns-listen %q: stub given more than once", s)
+			}
+			l.Stub = v[0]
+		case "upstream":
+			l.Upstream = v
+		default:
+			return DNSListener{}, fmt.Errorf("invalid --dns-listen %q: unknown option %q", s, key)
+		}
+	}
+
+	return l, nil
 }
 
 // splitDomains splits a comma-separated list of domains, trimming spaces and dots.
